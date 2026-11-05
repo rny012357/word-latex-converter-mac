@@ -1,0 +1,68 @@
+{
+  "word_version": "16.114",
+  "word_build": "16.114.1020",
+  "input_mode_observed_in_UI": "LaTeX",
+  "compile": "PASS",
+  "self_test": {
+    "passed": 24,
+    "failed": 0
+  },
+  "smoke": {
+    "converted": 4,
+    "retained": 0,
+    "rerun_converted": 0,
+    "omath_count": 4
+  },
+  "real_matrix_failure": {
+    "converted": 2,
+    "retained": 1,
+    "raw_matrix_source_exact_match": true,
+    "escaped_currency_exact_match": true,
+    "omath_count": 2
+  },
+  "matrix_diagnosis": [
+    {
+      "case": 1,
+      "result": "PASS",
+      "matrices": 1
+    },
+    {
+      "case": 2,
+      "result": "FAIL",
+      "stage": "BuildUp",
+      "error": -2147467259
+    },
+    {
+      "case": 3,
+      "result": "FAIL",
+      "stage": "BuildUp",
+      "error": -2147467259
+    },
+    {
+      "case": 4,
+      "result": "FAIL",
+      "stage": "BuildUp",
+      "error": -2147467259
+    },
+    {
+      "case": 5,
+      "result": "FAIL",
+      "stage": "BuildUp",
+      "error": -2147467259
+    },
+    {
+      "case": 6,
+      "result": "FAIL",
+      "reason": "matrix_count",
+      "actual": 0
+    },
+    {
+      "case": 7,
+      "result": "FAIL",
+      "reason": "matrix_count",
+      "actual": 0,
+      "input_mode": "LaTeX (UnicodeMath control not run)"
+    }
+  ],
+  "source_sha256": "4ce0bba25d8cc7489646d8ee6fca3cd3b00e89edc53554d74aee7e8228d80f25"
+}

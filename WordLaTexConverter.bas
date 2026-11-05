@@ -1,0 +1,624 @@
+Attribute VB_Name = "WordLaTexConverter"
+Option Explicit
+
+' ASCII source; ChrW(92) prevents a locale-dependent yen/backslash import.
+' No RegExp, COM, clipboard, shell, or external library is required.
+Private Const ENABLE_DOLLARS As Boolean = True
+Private Const MAX_BODY_LENGTH As Long = 16000
+Private Const BARRIER As String = vbNullChar
+
+Private Type MathSpan
+    First As Long
+    Last As Long
+    Width As Long
+    Display As Boolean
+End Type
+
+Public Sub ConvertLaTexInDocument()
+    Dim doc As Document, scope As Range
+    Dim converted As Long, retained As Long, skipped As Long
+    Dim issues As Long, detail As String, fatal As String
+    Dim oldScreen As Boolean
+    oldScreen = Application.ScreenUpdating
+    On Error GoTo Failed
+    If Documents.Count = 0 Then Exit Sub
+    Set doc = ActiveDocument
+    If doc.ReadOnly Or doc.ProtectionType <> wdNoProtection Then
+        MsgBox "Use an editable, unprotected copy of the document.": Exit Sub
+    End If
+    If doc.TrackRevisions Or doc.Revisions.Count > 0 Then
+        MsgBox "Tracked changes are present or recording is on. Use a clean copy.": Exit Sub
+    End If
+    If Selection.Type = wdSelectionBlock Then
+        MsgBox "A rectangular selection is not supported.": Exit Sub
+    End If
+    If Selection.Range.StoryType <> wdMainTextStory Then
+        MsgBox "Select text in the main document body.": Exit Sub
+    End If
+    If Selection.Start <> Selection.End Then
+        Set scope = Selection.Range.Duplicate
+    Else
+        Set scope = doc.Content.Duplicate
+    End If
+    oldScreen = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+    ConvertScope scope, converted, retained, skipped, issues, detail
+    GoTo Finished
+Failed:
+    fatal = CStr(Err.Number) & ": " & Err.Description
+Finished:
+    On Error Resume Next
+    Application.ScreenUpdating = oldScreen
+    If Not doc Is Nothing Then doc.Activate
+    On Error GoTo 0
+    If Len(fatal) > 0 Then
+        MsgBox "Stopped: " & fatal & vbCrLf & "See the Immediate window."
+    Else
+        MsgBox "Converted: " & converted & vbCrLf & _
+               "Retained: " & retained & vbCrLf & _
+               "Protected candidates: " & skipped & vbCrLf & _
+               "Delimiter issues: " & issues & vbCrLf & _
+               "Details: VBA Immediate window (View > Immediate Window)."
+    End If
+End Sub
+
+Private Sub ConvertScope(ByVal scope As Range, ByRef converted As Long, _
+        ByRef retained As Long, ByRef skipped As Long, ByRef issues As Long, _
+        ByRef detail As String, Optional ByVal injectStage As Long = 0)
+    Dim doc As Document, scratch As Document, backup As Document
+    Dim src As String, scan As String, spans() As MathSpan
+    Dim n As Long, i As Long, base As Long, raw As String, body As String
+    Dim target As Range, eq As OMath, reason As String, stage As String
+    Dim number As Long, description As String
+    On Error GoTo Fatal
+    Set doc = scope.Document
+    base = scope.Start
+    ' Include hidden text and field codes so omission cannot silently shift offsets.
+    scope.TextRetrievalMode.IncludeHiddenText = True
+    scope.TextRetrievalMode.IncludeFieldCodes = True
+    src = scope.Text
+    scan = src
+    MaskProtected scope, scan
+    ScanMath scan, spans, n, issues
+    Set backup = Documents.Add(Visible:=False)
+    For i = n To 1 Step -1
+        raw = Mid$(src, spans(i).First, spans(i).Last - spans(i).First + 1)
+        reason = "": stage = "guard"
+        Set target = CandidateRange(doc, base + spans(i).First - 1, base + spans(i).Last)
+        If target Is Nothing Then
+            reason = "Candidate is outside Word's character positions; source retained."
+            skipped = skipped + 1
+        ElseIf target.Text <> raw Then
+            reason = "Range/text offset mismatch; source retained."
+            skipped = skipped + 1
+        ElseIf ProtectedCandidate(target) Then
+            reason = "Protected content intersects candidate."
+            skipped = skipped + 1
+        Else
+            body = Mid$(raw, spans(i).Width + 1, Len(raw) - 2 * spans(i).Width)
+            ' A fresh document avoids stale math state after replacing an OMath.
+            Set scratch = Documents.Add(Visible:=False)
+            If TryBuild(body, spans(i).Display, scratch, eq, stage, reason, injectStage) Then
+                If CommitEquation(target, eq, backup, stage, reason, injectStage) Then
+                    converted = converted + 1
+                Else
+                    retained = retained + 1
+                End If
+            Else
+                retained = retained + 1
+            End If
+            Set eq = Nothing
+            scratch.Close SaveChanges:=wdDoNotSaveChanges
+            Set scratch = Nothing
+        End If
+        If Len(reason) > 0 Then
+            LogLine detail, "position=" & (base + spans(i).First - 1) & " stage=" & stage & _
+                " " & reason & " source=" & Replace(raw, vbCr, "<CR>")
+        End If
+    Next i
+    GoTo Cleanup
+Fatal:
+    number = Err.Number: description = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not scratch Is Nothing Then scratch.Close SaveChanges:=wdDoNotSaveChanges
+    If Not backup Is Nothing Then backup.Close SaveChanges:=wdDoNotSaveChanges
+    On Error GoTo 0
+    If number <> 0 Then Err.Raise number, "ConvertScope", description
+End Sub
+
+Private Function CandidateRange(ByVal doc As Document, ByVal first As Long, _
+        ByVal last As Long) As Range
+    On Error GoTo Unavailable
+    Set CandidateRange = doc.Range(first, last)
+    CandidateRange.TextRetrievalMode.IncludeHiddenText = True
+    CandidateRange.TextRetrievalMode.IncludeFieldCodes = True
+    Exit Function
+Unavailable:
+    Set CandidateRange = Nothing
+End Function
+
+Private Sub LogLine(ByRef detail As String, ByVal line As String)
+    detail = detail & line & vbCrLf
+    Debug.Print line
+End Sub
+
+Private Function Overlaps(ByVal a As Range, ByVal b As Range) As Boolean
+    If a.StoryType <> b.StoryType Then Exit Function
+    Overlaps = (a.Start < b.End And b.Start < a.End)
+End Function
+
+Private Function ProtectedCandidate(ByVal r As Range) As Boolean
+    Dim eq As OMath, f As Field, cc As ContentControl, bm As Bookmark, c As Comment
+    If r.InlineShapes.Count > 0 Or r.Hyperlinks.Count > 0 Then GoTo Protected
+    For Each eq In r.Document.OMaths
+        If Overlaps(r, eq.Range) Then GoTo Protected
+    Next eq
+    For Each f In r.Document.Fields
+        If r.Start < f.Result.End + 1 And r.End > f.Code.Start - 1 Then GoTo Protected
+    Next f
+    For Each cc In r.Document.ContentControls
+        If Overlaps(r, cc.Range) Then GoTo Protected
+    Next cc
+    For Each bm In r.Document.Bookmarks
+        If Overlaps(r, bm.Range) Then GoTo Protected
+        If bm.Range.Start >= r.Start And bm.Range.Start <= r.End Then GoTo Protected
+    Next bm
+    For Each c In r.Document.Comments
+        If Overlaps(r, c.Scope) Then GoTo Protected
+    Next c
+    Exit Function
+Protected:
+    ProtectedCandidate = True
+End Function
+
+Private Sub MaskPart(ByVal scope As Range, ByRef text As String, ByVal part As Range)
+    Dim a As Long, b As Long
+    If Not Overlaps(scope, part) Then Exit Sub
+    a = part.Start - scope.Start + 1: b = part.End - scope.Start
+    If a < 1 Then a = 1
+    If b > Len(text) Then b = Len(text)
+    If b >= a Then Mid$(text, a, b - a + 1) = String$(b - a + 1, BARRIER)
+End Sub
+
+Private Sub MaskProtected(ByVal scope As Range, ByRef text As String)
+    Dim eq As OMath, f As Field, cc As ContentControl, r As Range
+    For Each eq In scope.Document.OMaths
+        MaskPart scope, text, eq.Range
+    Next eq
+    For Each f In scope.Document.Fields
+        Set r = scope.Document.Range(f.Code.Start - 1, f.Result.End + 1)
+        MaskPart scope, text, r
+    Next f
+    For Each cc In scope.Document.ContentControls
+        MaskPart scope, text, cc.Range
+    Next cc
+End Sub
+
+Private Function IsEscaped(ByVal text As String, ByVal pos As Long) As Boolean
+    Dim n As Long
+    pos = pos - 1
+    Do While pos > 0
+        If Mid$(text, pos, 1) <> (ChrW(92)) Then Exit Do
+        n = n + 1: pos = pos - 1
+    Loop
+    IsEscaped = (n Mod 2 = 1)
+End Function
+
+Private Function DollarRun(ByVal text As String, ByVal pos As Long) As Long
+    Dim i As Long
+    i = pos
+    Do While i <= Len(text)
+        If Mid$(text, i, 1) <> "$" Then Exit Do
+        i = i + 1
+    Loop
+    DollarRun = i - pos
+End Function
+
+Private Function TokenAt(ByVal text As String, ByVal pos As Long) As String
+    Dim pair As String, n As Long
+    If IsEscaped(text, pos) Then Exit Function
+    pair = Mid$(text, pos, 2)
+    If pair = (ChrW(92) & "(") Or pair = (ChrW(92) & "[") Or pair = (ChrW(92) & ")") Or pair = (ChrW(92) & "]") Then
+        TokenAt = pair
+    ElseIf ENABLE_DOLLARS And Mid$(text, pos, 1) = "$" Then
+        If pos > 1 Then
+            If Mid$(text, pos - 1, 1) = "$" Then Exit Function
+        End If
+        n = DollarRun(text, pos)
+        If n = 1 Or n = 2 Then TokenAt = String$(n, "$")
+    End If
+End Function
+
+Private Function IsSpace(ByVal ch As String) As Boolean
+    IsSpace = (ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Or ch = Chr$(11))
+End Function
+
+' Positions are one-based inclusive; a hard barrier prevents crossing existing math.
+Private Sub ScanMath(ByVal text As String, ByRef spans() As MathSpan, _
+        ByRef count As Long, ByRef issues As Long)
+    Dim p As Long, q As Long, width As Long, token As String, closing As String
+    Dim other As String, display As Boolean, found As Boolean, ch As String
+    count = 0: issues = 0: p = 1
+    Do While p <= Len(text)
+        token = TokenAt(text, p)
+        closing = ""
+        Select Case token
+            Case (ChrW(92) & "("): closing = (ChrW(92) & ")")
+            Case (ChrW(92) & "["): closing = (ChrW(92) & "]")
+            Case "$", "$$": closing = token
+        End Select
+        If Len(closing) = 0 Then
+            p = p + 1
+        Else
+            width = Len(token): display = (token = (ChrW(92) & "[") Or token = "$$")
+            If token = "$" And IsSpace(Mid$(text, p + 1, 1)) Then
+                p = p + 1
+            Else
+                q = p + width: found = False
+                Do While q <= Len(text)
+                    ch = Mid$(text, q, 1)
+                    If ch = BARRIER Or ch = Chr$(7) Or ch = Chr$(12) Then Exit Do
+                    If Not display And IsSpace(ch) And ch <> " " And ch <> vbTab Then Exit Do
+                    If display And ch = vbCr And Mid$(text, q + 1, 1) = vbCr Then Exit Do
+                    If q - p - width > MAX_BODY_LENGTH Then Exit Do
+                    If ch = "$" And Not IsEscaped(text, q) Then
+                        If DollarRun(text, q) > 2 Then Exit Do
+                    End If
+                    other = TokenAt(text, q)
+                    If other = closing Then
+                        If closing <> "$" Or Not IsSpace(Mid$(text, q - 1, 1)) Then
+                            found = True: Exit Do
+                        End If
+                    ElseIf Len(other) > 0 Then
+                        ' A new/mismatched delimiter terminates this malformed candidate.
+                        Exit Do
+                    End If
+                    q = q + 1
+                Loop
+                If found Then
+                    count = count + 1
+                    ReDim Preserve spans(1 To count)
+                    spans(count).First = p: spans(count).Last = q + width - 1
+                    spans(count).Width = width: spans(count).Display = display
+                    p = q + width
+                Else
+                    issues = issues + 1
+                    If q > p + width Then
+                        p = q
+                    Else
+                        p = p + width
+                    End If
+                End If
+            End If
+        End If
+    Loop
+End Sub
+
+Private Function NormalizeBody(ByVal body As String) As String
+    body = Replace(body, vbCrLf, " ")
+    body = Replace(body, vbCr, " ")
+    body = Replace(body, vbLf, " ")
+    body = Replace(body, Chr$(11), " ")
+    NormalizeBody = Trim$(body)
+End Function
+
+Private Function TryBuild(ByVal body As String, ByVal display As Boolean, _
+        ByVal scratch As Document, ByRef eq As OMath, ByRef stage As String, _
+        ByRef reason As String, Optional ByVal injectStage As Long = 0) As Boolean
+    Dim r As Range
+    On Error GoTo Failed
+    Set eq = Nothing
+    stage = "prepare"
+    body = NormalizeBody(body)
+    If Len(body) = 0 Then Err.Raise vbObjectError + 2100, , "Empty math body."
+    If Not BalancedBraces(body) Then Err.Raise vbObjectError + 2110, , "Unbalanced braces."
+    If CountText(body, (ChrW(92) & "begin{bmatrix}")) <> CountText(body, (ChrW(92) & "end{bmatrix}")) Then
+        Err.Raise vbObjectError + 2111, , "Unbalanced bmatrix environment."
+    End If
+    scratch.Content.Text = body
+    Set r = scratch.Range(0, Len(body))
+    stage = "OMaths.Add"
+    Set r = scratch.OMaths.Add(r)
+    Set eq = r.OMaths(1)
+    stage = "BuildUp"
+    If injectStage = 1 And body = "FAIL_BUILD" Then
+        Err.Raise vbObjectError + 2101, , "Injected BuildUp failure."
+    End If
+    eq.BuildUp
+    stage = "validate"
+    ValidateEquation eq, body
+    If display Then
+        eq.Type = wdOMathDisplay
+    Else
+        eq.Type = wdOMathInline
+    End If
+    TryBuild = True
+    Exit Function
+Failed:
+    reason = CStr(Err.Number) & ": " & Err.Description
+    Set eq = Nothing
+End Function
+
+Private Function BalancedBraces(ByVal text As String) As Boolean
+    Dim i As Long, depth As Long, ch As String
+    For i = 1 To Len(text)
+        ch = Mid$(text, i, 1)
+        If Not IsEscaped(text, i) Then
+            If ch = "{" Then depth = depth + 1
+            If ch = "}" Then depth = depth - 1
+            If depth < 0 Then Exit Function
+        End If
+    Next i
+    BalancedBraces = (depth = 0)
+End Function
+
+Private Function CountText(ByVal text As String, ByVal needle As String) As Long
+    Dim p As Long
+    p = InStr(1, text, needle, vbBinaryCompare)
+    Do While p > 0
+        CountText = CountText + 1
+        p = InStr(p + Len(needle), text, needle, vbBinaryCompare)
+    Loop
+End Function
+
+Private Function CountXmlElement(ByVal xml As String, ByVal name As String) As Long
+    Dim p As Long, ch As String, needle As String
+    needle = "<m:" & name
+    p = InStr(1, xml, needle, vbBinaryCompare)
+    Do While p > 0
+        ch = Mid$(xml, p + Len(needle), 1)
+        If ch = ">" Or ch = " " Or ch = "/" Then CountXmlElement = CountXmlElement + 1
+        p = InStr(p + Len(needle), xml, needle, vbBinaryCompare)
+    Loop
+End Function
+
+Private Sub ValidateEquation(ByVal eq As OMath, ByVal body As String)
+    Dim text As String, i As Long, ch As String, xml As String, expected As Long
+    text = eq.Range.Text
+    For i = 1 To Len(text) - 1
+        If Mid$(text, i, 1) = (ChrW(92)) Then
+            ch = Mid$(text, i + 1, 1)
+            If (ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Then
+                Err.Raise vbObjectError + 2102, , "Unconverted command remains: " & text
+            End If
+        End If
+    Next i
+    expected = CountText(body, (ChrW(92) & "begin{bmatrix}"))
+    If expected > 0 Then
+        xml = eq.Range.WordOpenXML
+        If CountXmlElement(xml, "m") <> expected Then
+            Err.Raise vbObjectError + 2103, , "bmatrix/OMML matrix count mismatch."
+        End If
+    End If
+    If InStr(1, body, (ChrW(92) & "frac{"), vbBinaryCompare) > 0 Then
+        If Len(xml) = 0 Then xml = eq.Range.WordOpenXML
+        If CountXmlElement(xml, "f") < CountText(body, (ChrW(92) & "frac{")) Then
+            Err.Raise vbObjectError + 2104, , "Fraction structure is missing."
+        End If
+    End If
+End Sub
+
+Private Function CommitEquation(ByVal target As Range, ByVal eq As OMath, _
+        ByVal backup As Document, ByRef stage As String, ByRef reason As String, _
+        Optional ByVal injectStage As Long = 0) As Boolean
+    Dim saved As Range, changed As Range, doc As Document
+    Dim start As Long, oldLength As Long, beforeEnd As Long, changedEnd As Long
+    Dim original As String, mutationStarted As Boolean, savedError As String
+    Dim rollbackNumber As Long, rollbackDescription As String
+    On Error GoTo Failed
+    stage = "backup"
+    Set doc = target.Document
+    original = target.Text
+    start = target.Start: oldLength = target.End - start: beforeEnd = doc.Content.End
+    backup.Content.Text = ""
+    Set saved = backup.Range(0, 0)
+    saved.FormattedText = target.FormattedText
+    Set saved = backup.Range(0, backup.Content.End - 1)
+    If saved.Text <> original Then Err.Raise vbObjectError + 2105, , "Backup mismatch."
+    stage = "commit"
+    mutationStarted = True
+    target.FormattedText = eq.Range.FormattedText
+    If injectStage = 2 And original = (ChrW(92) & "(FAIL_COMMIT" & ChrW(92) & ")") Then
+        Err.Raise vbObjectError + 2106, , "Injected failure after replacement."
+    End If
+    changedEnd = start + oldLength + doc.Content.End - beforeEnd
+    Set changed = doc.Range(start, changedEnd)
+    If changed.OMaths.Count <> 1 Then Err.Raise vbObjectError + 2107, , "Commit lost the equation."
+    If changed.OMaths(1).Range.Start < start Or changed.OMaths(1).Range.End > changedEnd Then
+        Err.Raise vbObjectError + 2108, , "Equation extends outside replacement."
+    End If
+    CommitEquation = True
+    Exit Function
+Failed:
+    savedError = CStr(Err.Number) & ": " & Err.Description
+    If Not mutationStarted Then
+        reason = savedError: Exit Function
+    End If
+    ' Only this document range is changed between beforeEnd and rollback.
+    ' Never call Undo: a pre-mutation error could undo the user's prior edit.
+    On Error Resume Next
+    Err.Clear
+    changedEnd = start + oldLength + doc.Content.End - beforeEnd
+    Set changed = doc.Range(start, changedEnd)
+    changed.FormattedText = saved.FormattedText
+    rollbackNumber = Err.Number: rollbackDescription = Err.Description
+    If rollbackNumber = 0 Then
+        If changed.Text <> original Or doc.Content.End <> beforeEnd Then
+            rollbackNumber = vbObjectError + 2109
+            rollbackDescription = "Restored text/length did not match the original."
+        End If
+    End If
+    On Error GoTo 0
+    stage = "rollback"
+    reason = savedError
+    If rollbackNumber <> 0 Then
+        Err.Raise rollbackNumber, "CommitEquation", "ROLLBACK FAILED; STOPPED: " & rollbackDescription
+    End If
+End Function
+
+' Tests run the same scanner and conversion functions as the entry point.
+Public Sub CreateLaTexSmokeTest()
+    Dim d As Document
+    Set d = Documents.Add
+    d.Content.Text = ("Proportional gain: " & ChrW(92) & "(K_p=2.0" & ChrW(92) & ").") & vbCrLf & _
+        "Integral gain: $K_i=0.5$." & vbCrLf & _
+        ("Transfer function: " & ChrW(92) & "[G(s)=" & ChrW(92) & "frac{1}{Ts+1}" & ChrW(92) & "]") & vbCrLf & _
+        ("Mean: $$" & ChrW(92) & "bar{x}=" & ChrW(92) & "frac{1}{n}" & ChrW(92) & "sum_{i=1}^{n}x_i$$") & vbCrLf & _
+        ("Escaped currency: " & ChrW(92) & "$100.") & vbCrLf
+    d.Range(0, 0).Select
+End Sub
+
+Public Sub SelfTestLaTexConverter()
+    Dim report As String, passed As Long, failed As Long
+    Dim d As Document, n As Long, kept As Long, skipped As Long, issues As Long
+    Dim detail As String, before As String, r As Range, p As Long
+    On Error GoTo Fatal
+    CheckScan "four", (ChrW(92) & "(x" & ChrW(92) & ") " & ChrW(92) & "[y" & ChrW(92) & "] $z$ $$w$$"), 4, report, passed, failed
+    CheckScan "escaped dollars", (ChrW(92) & "$100 and " & ChrW(92) & "$200"), 0, report, passed, failed
+    CheckScan "triple dollars", "$$$x$$$", 0, report, passed, failed
+    CheckScan "two in paragraph", "$x$ and $y$", 2, report, passed, failed
+    CheckScan "unclosed recovery", (ChrW(92) & "(bad " & ChrW(92) & "[y" & ChrW(92) & "] $z$"), 2, report, passed, failed
+    CheckScan "inline paragraph boundary", "$bad" & vbCr & "$x$", 1, report, passed, failed
+    CheckScan "multiline display", (ChrW(92) & "[") & vbCr & "x" & vbCr & (ChrW(92) & "]"), 1, report, passed, failed
+    CheckScan "protected barrier", "$bad" & BARRIER & "$x$", 1, report, passed, failed
+    CheckScan "odd escapes", (ChrW(92) & "$x" & ChrW(92) & "$"), 0, report, passed, failed
+    CheckScan "even escapes", (ChrW(92) & ChrW(92) & "$x$"), 1, report, passed, failed
+    CheckScan "escaped slash opener", (ChrW(92) & ChrW(92) & "(x" & ChrW(92) & ")"), 0, report, passed, failed
+    CheckScan "empty", (ChrW(92) & "(" & ChrW(92) & ")"), 1, report, passed, failed
+    CheckScan "triple run in body", "$x$$$y$", 0, report, passed, failed
+    CheckScan "adjacent", (ChrW(92) & "(x" & ChrW(92) & ")" & ChrW(92) & "(y" & ChrW(92) & ")"), 2, report, passed, failed
+    CheckScan "display double-dollar priority", "$$x$$ $y$", 2, report, passed, failed
+    CheckScan "escaped closing dollar", ("$x+" & ChrW(92) & "$1$"), 1, report, passed, failed
+    AssertTest TokenAt(ChrW(92) & "(x" & ChrW(92) & ")", 1) = ChrW(92) & "(", _
+        "Unicode backslash delimiter", report, passed, failed
+    AssertTest BalancedBraces((ChrW(92) & "frac{1}{2}")) And Not BalancedBraces((ChrW(92) & "frac{1}{2")), _
+        "balanced and unbalanced braces", report, passed, failed
+    AssertTest BalancedBraces((ChrW(92) & "{x" & ChrW(92) & "}")), "escaped braces", report, passed, failed
+
+    Set d = Documents.Add(Visible:=False)
+    d.Content.Text = (ChrW(92) & "(a" & ChrW(92) & ") " & ChrW(92) & "(FAIL_BUILD" & ChrW(92) & ") " & ChrW(92) & "(b" & ChrW(92) & ")")
+    ConvertScope d.Content.Duplicate, n, kept, skipped, issues, detail, 1
+    AssertTest n = 2 And kept = 1 And d.OMaths.Count = 2 And _
+        InStr(d.Content.Text, (ChrW(92) & "(FAIL_BUILD" & ChrW(92) & ")")) > 0 And _
+        InStr(detail, "Injected BuildUp failure") > 0, _
+        "BuildUp failure retains source and continues on both sides", report, passed, failed
+    d.Close SaveChanges:=wdDoNotSaveChanges: Set d = Nothing
+
+    n = 0: kept = 0: skipped = 0: detail = ""
+    Set d = Documents.Add(Visible:=False)
+    d.Content.Text = (ChrW(92) & "(a" & ChrW(92) & ") " & ChrW(92) & "(FAIL_COMMIT" & ChrW(92) & ") " & ChrW(92) & "(b" & ChrW(92) & ")")
+    ConvertScope d.Content.Duplicate, n, kept, skipped, issues, detail, 2
+    AssertTest n = 2 And kept = 1 And d.OMaths.Count = 2 And _
+        InStr(d.Content.Text, (ChrW(92) & "(FAIL_COMMIT" & ChrW(92) & ")")) > 0 And _
+        InStr(detail, "Injected failure after replacement") > 0, _
+        "post-commit failure restores source and continues", report, passed, failed
+    before = d.Content.Text
+    n = 0: kept = 0: skipped = 0: detail = ""
+    ConvertScope d.Content.Duplicate, n, kept, skipped, issues, detail, 2
+    AssertTest n = 0 And kept = 1 And d.Content.Text = before, _
+        "rerun leaves existing equations unchanged", report, passed, failed
+    d.Close SaveChanges:=wdDoNotSaveChanges: Set d = Nothing
+
+    n = 0: kept = 0: skipped = 0: detail = ""
+    Set d = Documents.Add(Visible:=False)
+    d.Content.Text = (ChrW(92) & "(outside" & ChrW(92) & ") " & ChrW(92) & "(inside" & ChrW(92) & ") " & ChrW(92) & "(outside" & ChrW(92) & ")")
+    p = InStr(d.Content.Text, (ChrW(92) & "(inside" & ChrW(92) & ")"))
+    Set r = d.Range(p - 1, p - 1 + Len((ChrW(92) & "(inside" & ChrW(92) & ")")))
+    ConvertScope r, n, kept, skipped, issues, detail
+    AssertTest n = 1 And CountText(d.Content.Text, (ChrW(92) & "(outside" & ChrW(92) & ")")) = 2, _
+        "nonzero selection offset preserves outside text", report, passed, failed
+    d.Close SaveChanges:=wdDoNotSaveChanges: Set d = Nothing
+
+    n = 0: kept = 0: skipped = 0: detail = ""
+    Set d = Documents.Add(Visible:=False)
+    d.Content.Text = (ChrW(92) & "(a" & ChrW(92) & ") $hidden$ " & ChrW(92) & "(b" & ChrW(92) & ")")
+    p = InStr(d.Content.Text, "$hidden$")
+    Set r = d.Range(p - 1, p - 1 + Len("$hidden$"))
+    Set r = d.OMaths.Add(r)
+    before = r.OMaths(1).Range.Text
+    ConvertScope d.Content.Duplicate, n, kept, skipped, issues, detail
+    AssertTest n = 2 And d.OMaths.Count = 3 And InStr(d.Content.Text, before) > 0, _
+        "existing equation containing dollar delimiters is masked", report, passed, failed
+    d.Close SaveChanges:=wdDoNotSaveChanges: Set d = Nothing
+    GoTo Done
+Fatal:
+    failed = failed + 1
+    report = report & "ERROR " & Err.Number & ": " & Err.Description & vbCrLf
+    On Error Resume Next
+    If Not d Is Nothing Then d.Close SaveChanges:=wdDoNotSaveChanges
+    On Error GoTo 0
+Done:
+    Set d = Documents.Add
+    d.Content.Text = "WordLaTexConverter self-test" & vbCrLf & _
+        "Word " & Application.Version & " build " & Application.Build & vbCrLf & _
+        "Passed=" & passed & " Failed=" & failed & vbCrLf & report
+End Sub
+
+Private Sub CheckScan(ByVal name As String, ByVal text As String, ByVal expected As Long, _
+        ByRef report As String, ByRef passed As Long, ByRef failed As Long)
+    Dim spans() As MathSpan, n As Long, issues As Long
+    ScanMath text, spans, n, issues
+    AssertTest n = expected, name & " expected=" & expected & " actual=" & n, report, passed, failed
+End Sub
+
+Private Sub AssertTest(ByVal condition As Boolean, ByVal name As String, _
+        ByRef report As String, ByRef passed As Long, ByRef failed As Long)
+    If condition Then
+        passed = passed + 1: report = report & "PASS " & name & vbCrLf
+    Else
+        failed = failed + 1: report = report & "FAIL " & name & vbCrLf
+    End If
+End Sub
+
+Public Sub DiagnoseLaTexMatrices()
+    Dim d As Document, scratch As Document, eq As OMath
+    Dim a As String, b As String, c As String, dotA As String
+    Dim cases As Variant, expected As Variant, i As Long, actual As Long
+    Dim report As String, stage As String, reason As String, r As Range
+    On Error GoTo Failed
+    a = (ChrW(92) & "begin{bmatrix}x_1" & ChrW(92) & ChrW(92) & "x_2" & ChrW(92) & "end{bmatrix}")
+    b = (ChrW(92) & "begin{bmatrix}0&1" & ChrW(92) & ChrW(92) & "-2&-3" & ChrW(92) & "end{bmatrix}")
+    c = (ChrW(92) & "begin{bmatrix}u_1" & ChrW(92) & ChrW(92) & "u_2" & ChrW(92) & "end{bmatrix}")
+    dotA = (ChrW(92) & "begin{bmatrix}" & ChrW(92) & "dot{x}_1" & ChrW(92) & ChrW(92) & ChrW(92) & "dot{x}_2" & ChrW(92) & "end{bmatrix}")
+    cases = Array(a, a & "=" & c, a & "=" & b & c, dotA & "=" & b & c, _
+        (ChrW(92) & "begin{bmatrix}a" & ChrW(92) & "end{bmatrix}=" & ChrW(92) & "begin{bmatrix}b" & ChrW(92) & "end{bmatrix}" & ChrW(92) & "begin{bmatrix}c" & ChrW(92) & "end{bmatrix}"), _
+        (ChrW(92) & "left[" & ChrW(92) & "matrix{x_1" & ChrW(92) & ChrW(92) & "x_2}" & ChrW(92) & "right]=" & ChrW(92) & "left[" & ChrW(92) & "matrix{0&1" & ChrW(92) & ChrW(92) & "-2&-3}" & ChrW(92) & "right]" & ChrW(92) & "left[" & ChrW(92) & "matrix{u_1" & ChrW(92) & ChrW(92) & "u_2}" & ChrW(92) & "right]"), _
+        ("[" & ChrW(92) & "matrix(x_1@x_2)]=[" & ChrW(92) & "matrix(0&1@-2&-3)][" & ChrW(92) & "matrix(u_1@u_2)]"))
+    expected = Array(1, 2, 3, 3, 3, 3, 3)
+    Set d = Documents.Add
+    report = "Word " & Application.Version & " build " & Application.Build & vbCrLf
+    d.Content.Text = "Matrix diagnosis; record the input mode separately." & vbCrLf & report
+    For i = LBound(cases) To UBound(cases)
+        Set scratch = Documents.Add(Visible:=False)
+        stage = "": reason = ""
+        report = vbCrLf & "Case " & (i + 1) & ": " & CStr(cases(i)) & vbCrLf
+        If TryBuild(CStr(cases(i)), True, scratch, eq, stage, reason) Then
+            actual = CountXmlElement(eq.Range.WordOpenXML, "m")
+            If actual = CLng(expected(i)) Then
+                report = report & "PASS matrix count; visual check still required."
+            Else
+                report = report & "FAIL matrix count."
+            End If
+            report = report & " expected=" & expected(i) & " actual=" & actual & vbCrLf
+            d.Range(d.Content.End - 1, d.Content.End - 1).InsertAfter report
+            Set r = d.Range(d.Content.End - 1, d.Content.End - 1)
+            r.FormattedText = eq.Range.FormattedText
+            d.Range(d.Content.End - 1, d.Content.End - 1).InsertAfter vbCrLf
+        Else
+            report = report & "FAIL stage=" & stage & " " & reason & vbCrLf
+            d.Range(d.Content.End - 1, d.Content.End - 1).InsertAfter report
+        End If
+        Set eq = Nothing
+        scratch.Close SaveChanges:=wdDoNotSaveChanges: Set scratch = Nothing
+    Next i
+    d.Activate
+    Exit Sub
+Failed:
+    report = report & "ERROR " & Err.Number & ": " & Err.Description
+    On Error Resume Next
+    If Not scratch Is Nothing Then scratch.Close SaveChanges:=wdDoNotSaveChanges
+    If d Is Nothing Then Set d = Documents.Add
+    d.Range(d.Content.End - 1, d.Content.End - 1).InsertAfter report
+    d.Activate
+End Sub

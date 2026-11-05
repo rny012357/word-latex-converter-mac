@@ -1,0 +1,9 @@
+{
+  "vba_execution": "NOT RUN by this checker; see mac-word-results.json",
+  "word_macro_compilation": "NOT RUN by this checker; see mac-word-results.json",
+  "reference_model_cases_from_vba_test_vectors": 16,
+  "independent_golden_cases": 7,
+  "random_reference_model_invariant_cases": 1000,
+  "structural_source_checks": "PASS (not syntax/type compilation)",
+  "reference_model_checks": "PASS"
+}

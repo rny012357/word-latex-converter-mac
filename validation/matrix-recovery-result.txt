@@ -1,0 +1,4 @@
+Before:
+\[\begin{bmatrix}x_1\\x_2\end{bmatrix}=\begin{bmatrix}0&1\\-2&-3\end{bmatrix}\begin{bmatrix}u_1\\u_2\end{bmatrix}\]
+After:
+Currency: \$100 and \$200

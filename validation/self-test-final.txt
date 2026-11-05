@@ -1,0 +1,53 @@
+WordLaTexConverter self-test
+
+Word 16.114 build 16.114.1020
+
+Passed=24 Failed=0
+
+PASS four expected=4 actual=4
+
+PASS escaped dollars expected=0 actual=0
+
+PASS triple dollars expected=0 actual=0
+
+PASS two in paragraph expected=2 actual=2
+
+PASS unclosed recovery expected=2 actual=2
+
+PASS inline paragraph boundary expected=1 actual=1
+
+PASS multiline display expected=1 actual=1
+
+PASS protected barrier expected=1 actual=1
+
+PASS odd escapes expected=0 actual=0
+
+PASS even escapes expected=1 actual=1
+
+PASS escaped slash opener expected=0 actual=0
+
+PASS empty expected=1 actual=1
+
+PASS triple run in body expected=0 actual=0
+
+PASS adjacent expected=2 actual=2
+
+PASS display double-dollar priority expected=2 actual=2
+
+PASS escaped closing dollar expected=1 actual=1
+
+PASS Unicode backslash delimiter
+
+PASS balanced and unbalanced braces
+
+PASS escaped braces
+
+PASS BuildUp failure retains source and continues on both sides
+
+PASS post-commit failure restores source and continues
+
+PASS rerun leaves existing equations unchanged
+
+PASS nonzero selection offset preserves outside text
+
+PASS existing equation containing dollar delimiters is masked

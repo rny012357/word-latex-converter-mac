@@ -1,0 +1,20 @@
+Case 1: one bmatrix
+\[\begin{bmatrix}x_1\\x_2\end{bmatrix}\]
+
+Case 2: two bmatrix environments
+\[\begin{bmatrix}x_1\\x_2\end{bmatrix}=\begin{bmatrix}u_1\\u_2\end{bmatrix}\]
+
+Case 3: three bmatrix environments
+\[\begin{bmatrix}x_1\\x_2\end{bmatrix}=\begin{bmatrix}0&1\\-2&-3\end{bmatrix}\begin{bmatrix}u_1\\u_2\end{bmatrix}\]
+
+Case 4: three bmatrix environments with derivatives
+\[\begin{bmatrix}\dot{x}_1\\\dot{x}_2\end{bmatrix}=\begin{bmatrix}0&1\\-2&-3\end{bmatrix}\begin{bmatrix}u_1\\u_2\end{bmatrix}\]
+
+Case 5: three minimal bmatrix environments
+\[\begin{bmatrix}a\end{bmatrix}=\begin{bmatrix}b\end{bmatrix}\begin{bmatrix}c\end{bmatrix}\]
+
+Case 6: legacy LaTeX-style matrix syntax; experimental
+\[\left[\matrix{x_1\\x_2}\right]=\left[\matrix{0&1\\-2&-3}\right]\left[\matrix{u_1\\u_2}\right]\]
+
+Case 7: UnicodeMath; test separately in UnicodeMath input mode
+\[[\matrix(x_1@x_2)]=[\matrix(0&1@-2&-3)][\matrix(u_1@u_2)]\]

@@ -1,0 +1,9 @@
+Proportional gain: .
+
+Integral gain: .
+
+Transfer function:
+
+Mean:
+
+Escaped currency: \$100.
